@@ -103,7 +103,7 @@ output/
     ↓
 阶段 6: AI 质检 → /podcastcut-质检
     → Phase A: 数据层（delete_segments 正确性）
-    → Phase B: 信号层（能量/频谱/静音 + 可选 Gemini AI）
+    → Phase B: 信号层（能量/频谱/静音 + 可选 Qwen-Omni AI）
     → Phase C: 语义层（重转录对齐，残留检测）🆕v6
     → 反馈学习 ← QA 问题 → 更新基础剪辑规则
     ↓

@@ -3,7 +3,7 @@ name: podcastcut:质检
 description: |
   播客剪辑质检：两阶段自动检测。
   Phase A（数据层）：在 cut_audio 之后检查 delete_segments 的正确性——恢复句是否被误剪、手动删除是否生效、切点静音、大段删除衔接。
-  Phase B（信号层）：对剪辑后音频做信号分析（能量/频谱/静音）+ 可选 Gemini AI 听感评估，标记需要人工复听的片段。
+  Phase B（信号层）：对剪辑后音频做信号分析（能量/频谱/静音）+ 可选 Qwen-Omni AI 听感评估，标记需要人工复听的片段。
   触发词：质检、审查剪辑、检查音频、audit、QA、检查一下剪辑结果、check edit
 ---
 
@@ -37,9 +37,9 @@ pos: 在 /podcastcut-edit 之后使用
 2. **剪辑后的播客音频路径**（Phase B 需要）
    - 例如：`output/.../3_成品/podcast_精剪版_v14_trimmed.mp3`
 
-3. **（可选）Gemini API Key**
-   - 如果已配置环境变量 GEMINI_API_KEY，会自动启用 AI 听感评估
-   - 没有也没关系，Phase A + 信号层分析已能检出大多数问题
+3. **（可选）AI 听感评估**
+   - 已配置 DASHSCOPE_API_KEY（转录用同一个 Key）即自动启用，无需额外配置
+   - 不启用也没关系，Phase A + 信号层分析已能检出大多数问题
 ```
 
 ---
@@ -74,7 +74,7 @@ pos: 在 /podcastcut-edit 之后使用
 │  │    - 不自然静音 (silence duration)                    │ │
 │  │    - 播客模式：忽略 energy_jump（全是假阳性）          │ │
 │  │                                                     │ │
-│  │  Layer 2: AI 听感评估 (ai_listen.py / Gemini, 可选) │ │
+│  │  Layer 2: AI 听感评估 (ai_listen.py / Qwen-Omni, 可选)│ │
 │  │    - 全局采样：6 个 30s 片段评估整体节奏              │ │
 │  │    - 可疑复查：Layer 1 的 HIGH 问题 AI 二次确认       │ │
 │  │                                                     │ │
@@ -185,7 +185,7 @@ python3 <skill_dir>/scripts/signal_analysis.py \
 ### B2: Layer 2 — AI 听感评估（可选）
 
 ```bash
-# 需要 GEMINI_API_KEY（环境变量或 .env 文件）
+# 需要 DASHSCOPE_API_KEY（环境变量或 .env 文件，与转录共用同一个 Key）
 python3 <skill_dir>/scripts/ai_listen.py \
   --input <音频路径> \
   --signal-report <output_dir>/2_分析/qa_signal_report.json \
@@ -307,7 +307,7 @@ node <skill_dir>/scripts/semantic_review.js \
 
 **Phase B 输入：**
 - 剪辑后的播客音频（MP3 / WAV / M4A）
-- （可选）Gemini API Key（环境变量 `GEMINI_API_KEY`）
+- 阿里云 DashScope API Key（环境变量 `DASHSCOPE_API_KEY`，与转录共用同一个 Key；不配置则 Layer 2 自动跳过）
 
 **输出：**
 - `2_分析/audit_report.json` — Phase A 数据层质检报告
@@ -371,11 +371,11 @@ node <skill_dir>/scripts/semantic_review.js \
 
 **解决**：播客模式下完全忽略 energy_jump，只保留 spectral_jump 和 unnatural_silence。过滤后从 800 个 → 1 个，复听从 394 → 9 个。
 
-### 陷阱 2：Gemini 模型名需要用最新版
+### 陷阱 2：Qwen-Omni 必须流式调用
 
-**现象**：`gemini-2.0-flash` 返回 404 错误。
+**现象**：直接 `stream=False` 调用 Qwen-Omni 报错。
 
-**解决**：使用 `gemini-2.5-flash`。模型更新频繁，如果遇到 404，用 `client.models.list()` 查看可用模型。
+**解决**：Qwen-Omni 强制 `stream=True`，即便只要文本输出（`modalities=["text"]`）。`ai_listen.py` 已封装为累积所有 chunk 后返回完整字符串。默认模型 `qwen3-omni-flash`（单次音频上限 20 分钟，我们片段最多 30s，绰绰有余）。
 
 ### 陷阱 3：Check 1 恢复句误报——有意的 fine edit
 
@@ -385,7 +385,7 @@ node <skill_dir>/scripts/semantic_review.js \
 
 ### 陷阱 4：API Key 从 .env 自动加载
 
-`ai_listen.py` 会自动从项目根目录的 `.env` 文件读取 `GEMINI_API_KEY`，无需手动 export。
+`ai_listen.py` 会自动从项目根目录的 `.env` 文件读取 `DASHSCOPE_API_KEY`，无需手动 export。
 
 ---
 
@@ -399,13 +399,13 @@ node >= 16
 librosa>=0.10.0
 numpy>=1.24.0
 soundfile>=0.12.0
-google-genai>=1.0.0    # 可选，Layer 2 需要
+openai>=1.50.0         # 可选，Layer 2 需要（走 DashScope 兼容模式调用 Qwen-Omni）
 ```
 
 安装：
 ```bash
 pip install librosa numpy soundfile
-pip install google-genai          # 可选，启用 AI 听感评估
+pip install openai                # 可选，启用 AI 听感评估
 ```
 
 ---
@@ -421,7 +421,7 @@ pip install google-genai          # 可选，启用 AI 听感评估
 | AI 复查误报率 | 100%（10/10 全部假阳性） |
 | 综合评分 | 8.3/10 |
 | 需复听片段 | 9 个（约 45 秒） |
-| Gemini 模型 | gemini-2.5-flash |
+| Qwen-Omni 模型 | qwen3-omni-flash |
 | API 调用 | 16 次（6 全局 + 10 可疑复查） |
 
 ---

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Layer 2: AI 听感评估 — 用 Gemini Audio API 评估剪辑质量
+Layer 2: AI 听感评估 — 用 Qwen-Omni Audio API 评估剪辑质量
 
 两种采样策略：
 1. 全局采样 — 等间隔抽取 6 个 30s 片段，评估整体节奏和风格一致性
 2. 可疑片段复查 — 对 Layer 1 标记的 HIGH 问题片段做 AI 二次确认，减少误报
 
-需要 GEMINI_API_KEY 环境变量。
+需要 DASHSCOPE_API_KEY 环境变量（与转录共用同一个阿里云 Key）。
 
 用法：
     python3 ai_listen.py --input podcast.mp3 --signal-report qa_signal_report.json --output qa_ai_report.json
@@ -14,6 +14,7 @@ Layer 2: AI 听感评估 — 用 Gemini Audio API 评估剪辑质量
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -26,7 +27,7 @@ from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# Gemini prompt 模板（按 SKILL.md 定义）
+# Qwen-Omni prompt 模板（按 SKILL.md 定义）
 EVAL_PROMPT_GLOBAL = """You are a professional podcast editor evaluating audio quality.
 Listen carefully to this 30-second clip from a Chinese podcast and evaluate:
 
@@ -88,20 +89,37 @@ def extract_clip(input_path, start, duration, output_path):
     return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
 
-def call_gemini(client, model, audio_bytes, prompt, max_retries=3):
-    """调用 Gemini API 评估音频片段，带重试"""
-    from google.genai import types
+def call_qwen_omni(client, model, audio_bytes, prompt, max_retries=3):
+    """调用 Qwen-Omni API 评估音频片段，带重试。Qwen-Omni 强制 stream=True，需累积 chunks。"""
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
+            completion = client.chat.completions.create(
                 model=model,
-                contents=[
-                    prompt,
-                    types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
-                ]
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": f"data:;base64,{audio_b64}",
+                                "format": "wav",
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+                modalities=["text"],
+                stream=True,
+                stream_options={"include_usage": True},
             )
-            return response.text
+
+            parts = []
+            for chunk in completion:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    parts.append(chunk.choices[0].delta.content)
+            return "".join(parts)
         except Exception as e:
             error_str = str(e)
             if 'RATE_LIMIT' in error_str or '429' in error_str:
@@ -120,7 +138,7 @@ def call_gemini(client, model, audio_bytes, prompt, max_retries=3):
 
 
 def parse_json_response(text):
-    """从 Gemini 返回的文本中提取 JSON"""
+    """从模型返回的文本中提取 JSON"""
     if not text:
         return None
 
@@ -203,7 +221,7 @@ def main():
     parser.add_argument("--input", "-i", required=True, help="Input audio file path")
     parser.add_argument("--signal-report", "-s", help="Layer 1 signal report JSON (optional)")
     parser.add_argument("--output", "-o", required=True, help="Output AI report JSON path")
-    parser.add_argument("--model", "-m", default="gemini-2.5-flash", help="Gemini model (default: gemini-2.5-flash)")
+    parser.add_argument("--model", "-m", default="qwen3-omni-flash", help="Qwen-Omni model (default: qwen3-omni-flash)")
     parser.add_argument("--global-samples", type=int, default=6, help="Number of global sample clips (default: 6)")
     parser.add_argument("--max-suspicious", type=int, default=10, help="Max suspicious clips to review (default: 10)")
     args = parser.parse_args()
@@ -214,7 +232,7 @@ def main():
         sys.exit(1)
 
     # 检查 API Key
-    api_key = os.environ.get('GEMINI_API_KEY')
+    api_key = os.environ.get('DASHSCOPE_API_KEY')
     if not api_key:
         # 尝试从 .env 文件读取
         env_path = Path(__file__).resolve().parent.parent.parent / '.env'
@@ -222,21 +240,24 @@ def main():
             with open(env_path) as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith('GEMINI_API_KEY='):
+                    if line.startswith('DASHSCOPE_API_KEY='):
                         api_key = line.split('=', 1)[1].strip().strip('"').strip("'")
                         break
 
     if not api_key:
-        print("❌ 未找到 GEMINI_API_KEY")
+        print("❌ 未找到 DASHSCOPE_API_KEY")
         print("   设置方法:")
-        print("   1. export GEMINI_API_KEY='your-key'")
-        print("   2. 或在 .env 文件中添加 GEMINI_API_KEY=your-key")
+        print("   1. export DASHSCOPE_API_KEY='your-key'")
+        print("   2. 或在 .env 文件中添加 DASHSCOPE_API_KEY=your-key")
         sys.exit(1)
 
-    # 初始化 Gemini client
-    print("🤖 初始化 Gemini API...")
-    from google import genai
-    client = genai.Client(api_key=api_key)
+    # 初始化 Qwen-Omni client（走 DashScope OpenAI 兼容模式）
+    print("🤖 初始化 Qwen-Omni API...")
+    from openai import OpenAI
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
 
     # 获取音频时长
     result = subprocess.run(
@@ -280,7 +301,7 @@ def main():
             with open(clip_path, 'rb') as f:
                 audio_bytes = f.read()
 
-            response_text = call_gemini(client, args.model, audio_bytes, EVAL_PROMPT_GLOBAL)
+            response_text = call_qwen_omni(client, args.model, audio_bytes, EVAL_PROMPT_GLOBAL)
             parsed = parse_json_response(response_text)
 
             if parsed:
@@ -337,7 +358,7 @@ def main():
                         audio_bytes = f.read()
 
                     prompt = EVAL_PROMPT_SUSPICIOUS.format(issue_detail=issue['detail'])
-                    response_text = call_gemini(client, args.model, audio_bytes, prompt)
+                    response_text = call_qwen_omni(client, args.model, audio_bytes, prompt)
                     parsed = parse_json_response(response_text)
 
                     if parsed:
